@@ -304,3 +304,29 @@ for image_size in FRONTIER_S:
 pd.DataFrame(frontier).to_csv(RESULTS / "oom_frontier.csv", index=False)
 if MEMORY_FRACTION:
     torch.cuda.set_per_process_memory_fraction(1.0)
+
+# %% Ячейка 8. Достижимая полоса памяти -> eta_mem
+# Сеть нигде не упирается в память (её интенсивность ~90 FLOP/байт против ~13 у
+# карты), поэтому из основного прогона eta_mem не определяется — фит его просто
+# не трогает. Меряем отдельно, как и P_idle: копирование большого тензора читает
+# и пишет ровно свой размер и не делает ни одной арифметической операции.
+def measure_bandwidth(size_bytes=512 * 2 ** 20, repeats=20):
+    """Достижимая полоса памяти, байт/с."""
+    src = torch.empty(size_bytes // 4, dtype=torch.float32, device=DEVICE)
+    dst = torch.empty_like(src)
+    for _ in range(5):
+        dst.copy_(src)
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        dst.copy_(src)
+    torch.cuda.synchronize()
+    return 2 * size_bytes * repeats / (time.perf_counter() - t0)   # чтение + запись
+
+
+env["bw_achieved"] = measure_bandwidth()
+env["eta_mem"] = env["bw_achieved"] / env["bw_peak"]
+(RESULTS / "env.json").write_text(json.dumps(env, indent=2, ensure_ascii=False))
+print(f"полоса {env['bw_achieved'] / 1e9:.0f} ГБ/с из паспортных {env['bw_peak'] / 1e9:.0f}")
+print(f"eta_mem = {env['eta_mem']:.2f}")
