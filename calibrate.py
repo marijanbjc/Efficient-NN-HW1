@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
 
-import equations_2 as eq   # если переименуешь файл — поменяй импорт здесь
+import equations as eq   # если переименуешь файл — поменяй импорт здесь
 
 RESULTS = Path("results")
 env = json.loads((RESULTS / "env.json").read_text())
