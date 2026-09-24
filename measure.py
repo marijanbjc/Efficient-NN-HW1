@@ -1,7 +1,7 @@
 """
 Измерения на GPU для ДЗ-1: латентность, пиковая память, энергия, имена CUDA-ядер.
 
-Результаты: results/{measurements.csv, kernels.csv, oom_frontier.csv, env.json}
+Результаты: results/{measurements.csv, oom_frontier.csv, env.json}
 """
 
 # %% Ячейка 1. Окружение и флаги из §7 задания
@@ -13,7 +13,6 @@ from statistics import median
 
 import pandas as pd
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 from models import MyModel
 
@@ -184,70 +183,7 @@ pd.DataFrame(rows).to_csv(RESULTS / "measurements.csv", index=False)
 print(f"\n{len(rows)} конфигураций, OOM: {sum(r['oom'] for r in rows)}")
 
 
-# %% Ячейка 6. Имена CUDA-ядер по слоям -> kernels.csv
-# Формы входов известны из таблицы разрешений (лист 3), поэтому слои профилируем
-# по отдельности на тензоре нужной формы — ядро однозначно сопоставляется слою.
-# Выбор алгоритма cuDNN зависит от геометрии свёртки, а не от соседних слоёв.
-LAYER_INPUT = {
-    "conv1": lambda b, s: (b, 3, s, s),
-    "pool1": lambda b, s: (b, 32, s // 2, s // 2),
-    "conv2": lambda b, s: (b, 32, s // 4, s // 4),
-    "conv3": lambda b, s: (b, 64, s // 4, s // 4),
-    "conv4": lambda b, s: (b, 128, s // 8, s // 8),
-    "conv5": lambda b, s: (b, 256, s // 8, s // 8),
-    "conv6": lambda b, s: (b, 256, s // 16, s // 16),
-    "pool2": lambda b, s: (b, 512, s // 16, s // 16),
-    "fc1": lambda b, s: (b, 512),
-    "relu": lambda b, s: (b, 256),
-    "fc2": lambda b, s: (b, 256),
-}
-# 111 и 128 — вокруг обрыва производительности между B=64 и B=111:
-# без них не видно, на каком батче cuDNN меняет алгоритм
-KERNEL_B = [1, 8, 64, 111, 128, 256]
-ITERS = 10
-
-kernel_rows = []
-for image_size in BASE_S:
-    for batch in KERNEL_B:
-        for name, shape_of in LAYER_INPUT.items():
-            layer = getattr(model, name)
-            try:
-                inp = torch.randn(*shape_of(batch, image_size), device=DEVICE)
-                with torch.inference_mode():
-                    for _ in range(5):
-                        layer(inp)
-                    torch.cuda.synchronize()
-                    # acc_events=True обязателен: иначе профайлер чистит события
-                    # в конце каждого цикла и до отчёта доживают не все ядра
-                    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                                 acc_events=True) as prof:
-                        for _ in range(ITERS):
-                            layer(inp)
-                        torch.cuda.synchronize()
-                for evt in prof.key_averages():
-                    us = getattr(evt, "self_device_time_total", 0.0)
-                    if us > 0:
-                        kernel_rows.append({"S": image_size, "B": batch, "layer": name,
-                                            "kernel": evt.key, "us": us / ITERS})
-                del inp
-            except torch.cuda.OutOfMemoryError:
-                print(f"S={image_size} B={batch} {name}: OOM, пропускаем")
-            finally:
-                torch.cuda.empty_cache()
-
-kernels = pd.DataFrame(kernel_rows)
-kernels.to_csv(RESULTS / "kernels.csv", index=False)
-print(f"{len(kernels)} строк, уникальных ядер {kernels['kernel'].nunique()}, "
-      f"конфигураций {kernels.groupby(['S', 'B']).ngroups} из {len(BASE_S) * len(KERNEL_B)}")
-
-incomplete = kernels.groupby(["S", "B"])["layer"].nunique()
-incomplete = incomplete[incomplete < len(LAYER_INPUT)]
-for (image_size, batch), got in incomplete.items():
-    print(f"  неполно: S={image_size} B={batch} — {got} слоёв из {len(LAYER_INPUT)}")
-print(kernels.groupby("layer")["kernel"].nunique().to_string())
-
-
-# %% Ячейка 7. Граница OOM -> oom_frontier.csv
+# %% Ячейка 6. Граница OOM -> oom_frontier.csv
 # На полной памяти край сетки задания (B=256) до OOM не доходит, поэтому ищем
 # саму границу: максимальный проходящий B для каждого S. Её можно наложить на
 # кривую Memory(S, B) = ёмкость и сравнить с предсказанием напрямую.
@@ -305,7 +241,7 @@ pd.DataFrame(frontier).to_csv(RESULTS / "oom_frontier.csv", index=False)
 if MEMORY_FRACTION:
     torch.cuda.set_per_process_memory_fraction(1.0)
 
-# %% Ячейка 8. Достижимая полоса памяти -> eta_mem
+# %% Ячейка 7. Достижимая полоса памяти -> eta_mem
 # Сеть нигде не упирается в память (её интенсивность ~90 FLOP/байт против ~13 у
 # карты), поэтому из основного прогона eta_mem не определяется — фит его просто
 # не трогает. Меряем отдельно, как и P_idle: копирование большого тензора читает
@@ -330,3 +266,43 @@ env["eta_mem"] = env["bw_achieved"] / env["bw_peak"]
 (RESULTS / "env.json").write_text(json.dumps(env, indent=2, ensure_ascii=False))
 print(f"полоса {env['bw_achieved'] / 1e9:.0f} ГБ/с из паспортных {env['bw_peak'] / 1e9:.0f}")
 print(f"eta_mem = {env['eta_mem']:.2f}")
+
+
+# %% Ячейка 8. Прогон с искусственным потолком памяти -> measurements_capped.csv
+# На полной памяти сетка нигде не переполняется, поэтому проверить формулу Memory
+# на границе не на чем. Опускаем потолок до 10% памяти карты: тогда часть
+# конфигураций перестаёт влезать, а сама ёмкость известна точно — и предсказание
+# "упадёт там, где Memory(S, B) > потолка" становится проверяемым утверждением.
+#
+# Здесь нужен только факт "влезло или нет", поэтому делаем один проход на
+# конфигурацию вместо полного замера — это секунды вместо десяти минут.
+CAP_FRACTION = 0.10
+
+torch.cuda.empty_cache()
+torch.cuda.set_per_process_memory_fraction(CAP_FRACTION)
+cap_bytes = env["total_memory"] * CAP_FRACTION
+print(f"потолок памяти {cap_bytes / 1e9:.2f} ГБ")
+
+capped_rows = []
+for image_size in SIZES:
+    for batch in BATCHES:
+        row = {"S": image_size, "B": batch, "cap": cap_bytes, "oom": False}
+        try:
+            x = torch.randn(batch, 3, image_size, image_size, device=DEVICE)
+            torch.cuda.reset_peak_memory_stats()
+            with torch.inference_mode():
+                model(x)
+            torch.cuda.synchronize()
+            row["memory"] = torch.cuda.max_memory_allocated()
+            del x
+        except torch.cuda.OutOfMemoryError:
+            row["oom"] = True
+        finally:
+            torch.cuda.empty_cache()
+        capped_rows.append(row)
+
+torch.cuda.set_per_process_memory_fraction(1.0)
+
+capped = pd.DataFrame(capped_rows)
+capped.to_csv(RESULTS / "measurements_capped.csv", index=False)
+print(f"переполнений: {capped['oom'].sum()} из {len(capped)}")
